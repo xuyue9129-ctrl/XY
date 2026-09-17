@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>XY · 全球朝晚霞预报</title>
-  <meta name="description" content="XY：按分层云量与气溶胶，预报全球朝霞晚霞。可切换 ECMWF / ICON / GFS / GRAPES。" />
+  <title>全球朝晚霞预报</title>
+  <meta name="description" content="按分层云量、太阳光路与气溶胶，预报全球朝霞晚霞。可切换 ECMWF / ICON / GFS / GRAPES。" />
   <meta name="theme-color" content="#100c0a" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -12,7 +12,7 @@
   <link rel="preload" href="vendor/leaflet.css" as="style" />
   <link rel="preload" href="vendor/leaflet.js" as="script" />
   <link rel="preload" href="cities.js?v=11" as="script" />
-  <link rel="preload" href="app.js?v=11" as="script" />
+  <link rel="preload" href="app.js?v=14" as="script" />
   <link rel="preload" href="world.json" as="fetch" crossorigin />
   <link rel="stylesheet" href="vendor/leaflet.css" />
   <style>
@@ -31,6 +31,7 @@
       --safe-b: env(safe-area-inset-bottom, 0px);
       --safe-l: env(safe-area-inset-left, 0px);
       --safe-r: env(safe-area-inset-right, 0px);
+      --top-height: 166px;
     }
 
     * { box-sizing: border-box; }
@@ -107,7 +108,7 @@
       font-family: var(--font);
       font-style: italic;
       font-weight: 650;
-      font-size: clamp(24px, 2.4vw, 30px);
+      font-size: clamp(20px, 2vw, 26px);
       letter-spacing: 0.14em;
       line-height: 1;
       color: var(--gold);
@@ -329,7 +330,7 @@
 
     .rank {
       position: fixed;
-      top: calc(128px + var(--safe-t));
+      top: calc(var(--top-height) + 8px);
       left: calc(16px + var(--safe-l));
       width: 268px;
       bottom: calc(52px + var(--safe-b));
@@ -392,7 +393,7 @@
 
     .inspector {
       position: fixed;
-      top: calc(128px + var(--safe-t));
+      top: calc(var(--top-height) + 8px);
       right: calc(16px + var(--safe-r));
       width: min(332px, calc(100vw - 32px));
       bottom: calc(52px + var(--safe-b));
@@ -506,6 +507,7 @@
     .strip b { display: block; font-size: 13px; font-variant-numeric: tabular-nums; }
     .strip span { font-size: 10px; }
 
+    .g-unknown { color: #a8a8a8; }
     .g-none { color: #7a7168; }
     .g-faint { color: #c4a484; }
     .g-small { color: #d4924a; }
@@ -610,7 +612,7 @@
       }
       .search input { width: min(200px, 24vw); }
       .inspector {
-        top: calc(78px + var(--safe-t));
+        top: calc(var(--top-height) + 8px);
         right: calc(12px + var(--safe-r));
         width: min(320px, 38vw);
         bottom: calc(78px + var(--safe-b));
@@ -743,11 +745,11 @@
   </style>
 </head>
 <body>
-  <div id="map" role="application" aria-label="全国朝晚霞地图"></div>
+  <div id="map" role="application" aria-label="全球朝晚霞地图"></div>
 
   <header class="top">
     <div class="brand">
-      <strong>XY</strong>
+      <strong>朝晚霞预报</strong>
       <span id="headline">全球朝晚霞</span>
     </div>
     <div class="modes" role="tablist">
@@ -764,7 +766,7 @@
       <a id="phone-url" class="phone-url" href="#" hidden></a>
     </div>
     <div class="wx" role="tablist" aria-label="预报模式">
-      <button type="button" data-wx="ecmwf_ifs025" class="on">ECMWF 荐</button>
+      <button type="button" data-wx="ecmwf_ifs025" class="on">ECMWF</button>
       <button type="button" data-wx="icon_seamless">ICON</button>
       <button type="button" data-wx="gfs_seamless">GFS</button>
       <button type="button" data-wx="cma_grapes_global">GRAPES</button>
@@ -793,13 +795,14 @@
       <span><b style="background:#ff5a1f"></b>大烧</span>
       <span><b style="background:#ffd08a"></b>满天</span>
     </div>
-    <div class="note">XY。可切换 ECMWF（推荐）/ ICON / GFS / 中国 GRAPES。预报是概率，当天更准。</div>
+    <div class="note">保守观赏指数 0–100，非发生概率。各地按当地日期展示，两天外仅供趋势参考。</div>
   </div>
 
   <div id="status" hidden></div>
 
   <script src="vendor/leaflet.js" defer></script>
   <script src="cities.js?v=11" defer></script>
-  <script src="app.js?v=11" defer></script>
+  <script src="forecast.js?v=14" defer></script>
+  <script src="app.js?v=14" defer></script>
 </body>
 </html>

@@ -6,14 +6,14 @@
   const AIR = "https://air-quality-api.open-meteo.com/v1/air-quality";
   const BATCH = 20;
   const DAYS = 7;
-  const CACHE_KEY = "xy-v9";
-  const CACHE_MS = 6 * 60 * 60 * 1000;
+  const CACHE_KEY = "glow-v14";
+  const CACHE_MS = 30 * 60 * 1000;
 
   const WX_MODELS = [
-    { id: "ecmwf_ifs025", label: "ECMWF", hint: "欧洲中心 IFS，全球综合最稳，推荐" },
+    { id: "ecmwf_ifs025", label: "ECMWF", hint: "欧洲中心 IFS，单模型参考" },
     { id: "icon_seamless", label: "ICON", hint: "德国 DWD，云层分层细" },
     { id: "gfs_seamless", label: "GFS", hint: "美国 NOAA，更新勤" },
-    { id: "cma_grapes_global", label: "GRAPES", hint: "中国气象局，本土有时更贴" },
+    { id: "cma_grapes_global", label: "GRAPES", hint: "中国气象局 GRAPES，单模型参考" },
     { id: "best_match", label: "自动", hint: "Open-Meteo 就近拼合" }
   ];
 
@@ -103,32 +103,26 @@
     booted: false,
     loading: true,
     wxModel: "ecmwf_ifs025",
-    packs: {},
-    error: "",
-    horizon: null
+    horizon: null,
+    generation: 0,
+    probeToken: 0,
+    customToken: 0,
+    horizonCache: new Map()
   };
 
   const $ = (id) => document.getElementById(id);
 
-  function trapezoid(x, a, b, c, d) {
-    if (x == null || Number.isNaN(x)) return 0;
-    if (x <= a || x >= d) return 0;
-    if (x >= b && x <= c) return 1;
-    if (x < b) return (x - a) / (b - a);
-    return (d - x) / (d - a);
-  }
-
-  function clamp(n, lo, hi) {
-    return Math.max(lo, Math.min(hi, n));
-  }
+  const F = window.GlowForecast;
+  const { clamp, buildDays, fmtTime } = F;
 
   function gradeOf(score) {
+    if (!F.finite(score)) return { key: "unknown", label: "暂无预报", hint: "数据不足，暂不评分" };
     let g = GRADES[0];
     for (const row of GRADES) if (score >= row.min) g = row;
     return g;
   }
-
   function gradeColor(score) {
+    if (!F.finite(score)) return "#8c8c8c";
     if (score >= 80) return "#ffd08a";
     if (score >= 65) return "#ff5a1f";
     if (score >= 50) return "#f07832";
@@ -136,205 +130,35 @@
     if (score >= 19) return "#a89278";
     return "#4e463f";
   }
-
-  function num(v, fallback = null) {
-    return v == null || Number.isNaN(Number(v)) ? fallback : Number(v);
+  function display(value, suffix = "", digits = 0) {
+    return F.finite(value) ? value.toFixed(digits) + suffix : "—";
   }
-
-  function pad(n) {
-    return String(n).padStart(2, "0");
+  function confidence(dayIndex, result, day) {
+    if (!F.finite(result?.score)) return { label: "无法判断" };
+    const lead = Math.max(0, (result.event * 1000 - Date.now()) / 86400000);
+    let value = lead < 1 ? 0.82 : lead < 2 ? 0.72 : lead < 3 ? 0.60 : lead < 4 ? 0.48 : 0.32;
+    value *= result.quality;
+    if (result.spread > 25) value *= 0.8;
+    if (!result.horizon?.available) value *= 0.9;
+    if (Date.now() - day.fetchedAt > CACHE_MS) value *= 0.7;
+    return { label: value >= 0.7 ? "较高" : value >= 0.45 ? "中等" : "偏低" };
   }
-
-  function parseStamp(iso) {
-    const [date, time] = String(iso).split("T");
-    const [y, m, d] = date.split("-").map(Number);
-    const [hh, mm] = (time || "00:00").split(":").map(Number);
-    return { date, y, m, d, hh, mm: mm || 0 };
-  }
-
-  function toDate(iso) {
-    const p = parseStamp(iso);
-    return new Date(p.y, p.m - 1, p.d, p.hh, p.mm);
-  }
-
-  function col(hourly, key, i, fallback) {
-    const a = hourly && hourly[key];
-    if (!a) return fallback;
-    return num(a[i], fallback);
-  }
-
-  function sampleAt(hourly, air, i) {
-    if (i < 0 || !hourly || !hourly.time || i >= hourly.time.length) return null;
-    const t = hourly.time[i];
-    let ai = -1;
-    if (air && air.time) {
-      ai = air.time.indexOf(t);
-      if (ai < 0) {
-        const prefix = t.slice(0, 13);
-        ai = air.time.findIndex((x) => x.startsWith(prefix));
-      }
-    }
-    return {
-      high: col(hourly, "cloud_cover_high", i, 0),
-      mid: col(hourly, "cloud_cover_mid", i, 0),
-      low: col(hourly, "cloud_cover_low", i, 0),
-      total: col(hourly, "cloud_cover", i, 0),
-      visKm: col(hourly, "visibility", i, 10000) / 1000,
-      rh: col(hourly, "relative_humidity_2m", i, 60),
-      precip: col(hourly, "precipitation", i, 0),
-      weather: col(hourly, "weather_code", i, 0),
-      aod: ai >= 0 ? num(air.aerosol_optical_depth[ai], null) : null,
-      pm25: ai >= 0 ? num(air.pm2_5[ai], null) : null,
-      hourLabel: t.slice(11, 16)
-    };
-  }
-
-  function pickHour(hourly, air, iso) {
-    const event = toDate(iso);
-    let best = -1;
-    let bestAbs = Infinity;
-    hourly.time.forEach((t, i) => {
-      const dt = Math.abs(toDate(t) - event);
-      if (dt < bestAbs) {
-        bestAbs = dt;
-        best = i;
-      }
-    });
-    return sampleAt(hourly, air, best);
-  }
-
-  function weightedSample(hourly, air, iso, mode) {
-    const event = toDate(iso);
-    const lo = mode === "sunrise" ? -70 : -55;
-    const hi = mode === "sunrise" ? 40 : 65;
-    const sigma = 32;
-    const ok = [];
-    hourly.time.forEach((t, i) => {
-      const dt = (toDate(t) - event) / 60000;
-      if (dt < lo || dt > hi) return;
-      const w = Math.exp(-0.5 * (dt / sigma) ** 2);
-      if (w < 0.12) return;
-      const s = sampleAt(hourly, air, i);
-      if (s) ok.push({ s, w, dt });
-    });
-    if (!ok.length) {
-      const s = pickHour(hourly, air, iso);
-      return s ? Object.assign(s, { window: s.hourLabel ? [s.hourLabel] : [] }) : null;
-    }
-    ok.sort((a, b) => Math.abs(a.dt) - Math.abs(b.dt));
-    const keys = ["high", "mid", "low", "total", "visKm", "rh", "precip", "aod", "pm25"];
-    const mixed = { weather: ok[0].s.weather, hourLabel: ok[0].s.hourLabel };
-    for (const k of keys) {
-      let n = 0;
-      let d = 0;
-      for (const x of ok) {
-        if (x.s[k] == null) continue;
-        n += x.s[k] * x.w;
-        d += x.w;
-      }
-      mixed[k] = d ? n / d : null;
-    }
-    mixed.window = ok.map((x) => x.s.hourLabel);
-    return mixed;
-  }
-
-  function scoreSample(s) {
-    if (!s) {
-      return {
-        score: 0,
-        parts: { canvas: 0, horizon: 0, cover: 0, clarity: 0, rain: 1 },
-        sample: null
-      };
-    }
-
-    let rain = 1;
-    if (s.precip >= 1.2) rain = 0.12;
-    else if (s.precip >= 0.4) rain = 0.38;
-    else if (s.precip >= 0.1) rain = 0.7;
-    if (s.weather === 45 || s.weather === 48) rain *= 0.4;
-    if (s.weather >= 95) rain *= 0.25;
-
-    const highScore = trapezoid(s.high, 6, 32, 68, 96);
-    const midScore = trapezoid(s.mid, 8, 24, 50, 88);
-    const canvas = clamp(highScore * 0.7 + midScore * 0.3, 0, 1);
-    const horizon = clamp(1 - Math.pow(s.low / 100, 1.18), 0, 1);
-    const cover = trapezoid(s.total, 8, 28, 62, 96);
-
-    const visScore = clamp((s.visKm - 3.5) / 16.5, 0, 1);
-    const rhScore = s.rh <= 52 ? 1 : s.rh >= 92 ? 0.22 : 1 - ((s.rh - 52) / 40) * 0.78;
-
-    let aodScore = 0.72;
-    if (s.aod != null) {
-      if (s.aod < 0.07) aodScore = 0.84;
-      else if (s.aod < 0.28) aodScore = 1;
-      else if (s.aod < 0.45) aodScore = 0.68;
-      else if (s.aod < 0.75) aodScore = 0.38;
-      else aodScore = 0.18;
-    } else if (s.pm25 != null) {
-      if (s.pm25 < 12) aodScore = 0.86;
-      else if (s.pm25 < 35) aodScore = 1;
-      else if (s.pm25 < 75) aodScore = 0.66;
-      else if (s.pm25 < 150) aodScore = 0.38;
-      else aodScore = 0.16;
-    }
-    const clarity = visScore * 0.46 + rhScore * 0.24 + aodScore * 0.3;
-
-    const dramatic = (canvas * 0.7 + cover * 0.3) * (0.42 + 0.58 * horizon);
-    let raw = (dramatic * 0.8 + clarity * 0.2) * rain;
-    if (horizon < 0.22) raw *= 0.32;
-    if (canvas < 0.1 && horizon > 0.72 && rain > 0.8) {
-      raw = clamp(0.16 + clarity * 0.14, 0, 0.3);
-    }
-    const score = Math.round(clamp(raw, 0, 1) * 100);
-    return { score, parts: { canvas, horizon, cover, clarity, rain }, sample: s };
-  }
-
-  function eventScore(hourly, air, iso, mode) {
-    const mixed = weightedSample(hourly, air, iso, mode);
-    const chosen = scoreSample(mixed);
-    chosen.window = mixed ? mixed.window : [];
-    return chosen;
-  }
-
-  function addMinutes(iso, mins) {
-    const p = parseStamp(iso);
-    const dt = new Date(p.y, p.m - 1, p.d, p.hh, p.mm);
-    dt.setMinutes(dt.getMinutes() + mins);
-    return pad(dt.getHours()) + ":" + pad(dt.getMinutes());
-  }
-
-  function confidence(dayIndex, result) {
-    let c = dayIndex <= 0 ? 0.86 : dayIndex === 1 ? 0.78 : dayIndex === 2 ? 0.64 : dayIndex === 3 ? 0.5 : 0.36;
-    if (result && result.parts.rain < 0.5) c *= 0.9;
-    if (dayIndex >= 4) c *= 0.9;
-    const label = c >= 0.75 ? "较高" : c >= 0.55 ? "中等" : "偏低";
-    return { value: c, label };
-  }
-
   function diagnose(mode, result) {
     const s = result.sample;
-    if (!s) return "这一时次缺少云况，无法判断。";
+    if (!s) return result.reason || "这一时次缺少云况，无法判断。";
     const bits = [];
-    const side = mode === "sunset" ? "西边" : "东边";
     if (s.precip >= 0.4) bits.push("有降水，云底容易发灰");
-    else if (s.weather === 45 || s.weather === 48) bits.push("有雾，通透度会被压低");
-    if (result.parts.horizon < 0.34) bits.push(`低云偏多，${side}光路可能被挡`);
-    if (result.parts.canvas < 0.14 && result.parts.horizon > 0.6) {
-      bits.push("中高云太少，难成火烧云，最多地平线一层颜色");
-    } else if (s.high >= 28 && s.low < 42) {
-      bits.push("高云够当画布，结构合适");
-    }
-    if (s.mid >= 22 && s.high >= 18) bits.push("中高云叠层，颜色会比较有层次");
-    if (result.parts.clarity < 0.4) bits.push("湿度或气溶胶偏高，颜色容易发糊");
-    else if (result.parts.clarity > 0.78) bits.push("空气相对通透");
-    if (!bits.length) bits.push("各要素中等，成霞看临近云的空隙");
+    if ([45, 48].includes(s.weather)) bits.push("有雾，通透度受限");
+    if (s.low >= 65) bits.push("本地低云偏多，可能遮挡视野");
+    if (s.high < 8 && s.mid < 8) bits.push("中高云偏少，以地平线淡霞为主");
+    else if (result.parts.canvas >= 0.5) bits.push("中高云有利于呈现霞光");
+    if (result.horizon?.available && result.horizon.obstruction > 0.45) bits.push("太阳方向云雨较多，已下调指数");
+    if (result.parts.clarity < 0.4) bits.push("空气通透度较差");
+    if (s.aod >= 0.45 || s.pm25 >= 75) bits.push("霾或气溶胶偏多，已保守下调指数");
+    if (s.total + 15 < Math.max(s.high, s.mid, s.low)) bits.push("总云量与分层云量不一致，已保守处理");
+    if (result.spread > 25) bits.push("时段内云况变化较大，结果不稳定");
+    if (!bits.length) bits.push("成霞仍取决于临近云层空隙");
     return bits.slice(0, 3).join("。") + "。";
-  }
-
-  function fmtTime(iso) {
-    if (!iso) return "—";
-    const p = parseStamp(iso);
-    return `${pad(p.hh)}:${pad(p.mm)}`;
   }
 
   function weekday(dateStr) {
@@ -359,7 +183,7 @@
     try {
       const res = await fetch(url, { signal: ctrl.signal });
       if (!res.ok) throw new Error("HTTP " + res.status);
-      return res.json();
+      return await res.json();
     } finally {
       clearTimeout(timer);
     }
@@ -375,30 +199,16 @@
     return WX_MODELS.find((m) => m.id === state.wxModel) || WX_MODELS[0];
   }
 
-  function weatherURL(lats, lons) {
+  function weatherURL(lats, lons, model = state.wxModel) {
     const n = String(lats).split(",").length;
     const tzs = Array.from({ length: n }, () => "auto").join(",");
-    return `${FORECAST}?latitude=${lats}&longitude=${lons}&hourly=${HOURLY}&daily=sunrise,sunset&timezone=${tzs}&forecast_days=${DAYS}&models=${state.wxModel}`;
+    return `${FORECAST}?latitude=${lats}&longitude=${lons}&hourly=${HOURLY}&daily=sunrise,sunset&timezone=${tzs}&timeformat=unixtime&forecast_days=${DAYS}&models=${model}`;
   }
 
   function airURL(lats, lons) {
     const n = String(lats).split(",").length;
     const tzs = Array.from({ length: n }, () => "auto").join(",");
-    return `${AIR}?latitude=${lats}&longitude=${lons}&hourly=${AQ_HOURLY}&timezone=${tzs}&forecast_days=${DAYS}&domains=cams_global`;
-  }
-
-  function buildDays(weather, air) {
-    const days = [];
-    const n = weather.daily.time.length;
-    for (let i = 0; i < n; i++) {
-      const date = weather.daily.time[i];
-      const sunrise = weather.daily.sunrise[i];
-      const sunset = weather.daily.sunset[i];
-      const rise = eventScore(weather.hourly, air && air.hourly, sunrise, "sunrise");
-      const set = eventScore(weather.hourly, air && air.hourly, sunset, "sunset");
-      days.push({ date, sunrise, sunset, sunriseGlow: rise, sunsetGlow: set });
-    }
-    return days;
+    return `${AIR}?latitude=${lats}&longitude=${lons}&hourly=${AQ_HOURLY}&timezone=${tzs}&timeformat=unixtime&forecast_days=${DAYS}&domains=cams_global`;
   }
 
   function currentGlow(place) {
@@ -413,122 +223,65 @@
 
   function alignPayloads(batch, payloads) {
     const list = asList(payloads);
-    const used = new Set();
-    return batch.map((place) => {
-      let bestI = -1;
-      let bestD = Infinity;
-      list.forEach((o, i) => {
-        if (!o || used.has(i) || o.latitude == null) return;
-        const d = Math.hypot(o.latitude - place.lat, (o.longitude - place.lon) * Math.cos((place.lat * Math.PI) / 180));
-        if (d < bestD) {
-          bestD = d;
-          bestI = i;
-        }
-      });
-      if (bestI < 0) return null;
-      used.add(bestI);
-      return list[bestI];
-    });
+    // Open-Meteo returns coordinates in request order. Grid snapping is not identity.
+    return batch.map((_, i) => list[i] || null);
   }
-
-  async function fetchWeatherBatch(batch) {
-    if (!batch.length) return;
+  async function fetchWeatherBatch(batch, model, generation) {
+    if (!batch.length || generation !== state.generation) return;
     const lats = batch.map((p) => p.lat.toFixed(4)).join(",");
     const lons = batch.map((p) => p.lon.toFixed(4)).join(",");
-    let lastErr;
-    for (let t = 0; t < 2; t++) {
-      try {
-        const weatherRaw = await getJSON(weatherURL(lats, lons));
-        const weathers = alignPayloads(batch, weatherRaw);
-        batch.forEach((place, i) => {
-          if (!weathers[i]) return;
-          place._weather = weathers[i];
-          place.days = buildDays(weathers[i], place._air || null);
-        });
-        if (batch.some((p) => p.days)) return;
-        throw new Error("empty weather batch");
-      } catch (err) {
-        lastErr = err;
-        await new Promise((r) => setTimeout(r, 350 * (t + 1)));
-      }
-    }
-    throw lastErr;
+    const raw = await getJSON(weatherURL(lats, lons, model));
+    if (generation !== state.generation) return;
+    const weathers = alignPayloads(batch, raw);
+    batch.forEach((place, i) => {
+      if (!weathers[i]?.daily || !weathers[i]?.hourly) return;
+      place._weather = weathers[i];
+      place.days = buildDays(weathers[i], null);
+    });
   }
-
-  async function fetchAirBatch(batch) {
+  async function fetchAirBatch(batch, generation) {
     const ready = batch.filter((p) => p._weather);
-    if (!ready.length) return;
-    const lats = ready.map((p) => p.lat.toFixed(4)).join(",");
-    const lons = ready.map((p) => p.lon.toFixed(4)).join(",");
+    if (!ready.length || generation !== state.generation) return;
     try {
-      const airRaw = await getJSON(airURL(lats, lons));
-      const airs = alignPayloads(ready, airRaw);
+      const lats = ready.map((p) => p.lat.toFixed(4)).join(",");
+      const lons = ready.map((p) => p.lon.toFixed(4)).join(",");
+      const raw = await getJSON(airURL(lats, lons));
+      if (generation !== state.generation) return;
+      const airs = alignPayloads(ready, raw);
       ready.forEach((place, i) => {
-        if (!airs[i] || !place._weather) return;
-        place._air = airs[i];
-        place.days = buildDays(place._weather, airs[i]);
+        if (!airs[i]?.hourly || !place._weather) return;
+        place.days = buildDays(place._weather, airs[i], place.days[0].fetchedAt);
       });
-    } catch {
-      /* air optional */
-    }
+    } catch { /* Air data is optional; keep missing values visible. */ }
   }
-
-  async function fetchOne(lat, lon) {
-    const weather = asList(await getJSON(weatherURL(lat.toFixed(4), lon.toFixed(4))))[0];
-    const air = await getJSON(airURL(lat.toFixed(4), lon.toFixed(4))).catch(() => null);
-    return buildDays(weather, air ? asList(air)[0] : null);
+  async function fetchOne(lat, lon, model) {
+    const [weather, air] = await Promise.all([
+      getJSON(weatherURL(lat.toFixed(4), lon.toFixed(4), model)),
+      getJSON(airURL(lat.toFixed(4), lon.toFixed(4))).catch(() => null)
+    ]);
+    return buildDays(asList(weather)[0], air ? asList(air)[0] : null);
   }
-
-  function cacheSlot() {
-    return CACHE_KEY + ":" + state.wxModel;
+  function cacheSlot() { return CACHE_KEY + ":" + state.wxModel; }
+  function freshDays(days) {
+    return days?.length && Date.now() - days[0].fetchedAt < CACHE_MS &&
+      days[0].date === F.localDate(Date.now() / 1000, days[0].timezone);
   }
-
   function cacheRead() {
     try {
-      const raw = localStorage.getItem(cacheSlot()) || sessionStorage.getItem(cacheSlot());
-      if (!raw) return null;
-      const obj = JSON.parse(raw);
-      if (Date.now() - obj.t > CACHE_MS) return null;
-      return obj.places;
-    } catch {
-      return null;
-    }
+      const obj = JSON.parse(localStorage.getItem(cacheSlot()) || sessionStorage.getItem(cacheSlot()) || "null");
+      if (!obj || Date.now() - obj.t > CACHE_MS) return null;
+      return obj.places.filter((p) => freshDays(p.days));
+    } catch { return null; }
   }
-
-  function cacheWrite(places) {
+  function cacheWrite() {
     try {
-      const slim = places.map((p) => ({
-        id: p.id,
-        days: p.days
-      }));
-      const payload = JSON.stringify({ t: Date.now(), places: slim });
-      try {
-        localStorage.setItem(cacheSlot(), payload);
-      } catch {
-        sessionStorage.setItem(cacheSlot(), payload);
-      }
-    } catch {
-      /* quota */
-    }
+      const places = state.places.filter((p) => p.id !== "custom" && freshDays(p.days))
+        .map((p) => ({ id: p.id, days: p.days }));
+      const payload = JSON.stringify({ t: Date.now(), places });
+      try { localStorage.setItem(cacheSlot(), payload); }
+      catch { sessionStorage.setItem(cacheSlot(), payload); }
+    } catch { /* Storage is optional. */ }
   }
-
-  function snapshotPack() {
-    if (!state.places.some((p) => p.days)) return;
-    state.packs[state.wxModel] = state.places.map((p) => ({ id: p.id, days: p.days }));
-  }
-
-  function restorePack(id) {
-    const pack = state.packs[id];
-    if (!pack) return false;
-    const byId = new Map(pack.map((x) => [x.id, x]));
-    state.places.forEach((p) => {
-      const hit = byId.get(p.id);
-      p.days = hit && hit.days ? hit.days : null;
-      p._weather = null;
-    });
-    return state.places.some((p) => p.days);
-  }
-
   function setStatus(text, kind) {
     const el = $("status");
     el.textContent = text || "";
@@ -538,8 +291,8 @@
 
   function renderDays() {
     const host = $("days");
-    const sample = state.places.find((p) => p.days && p.days.length);
-    if (!sample) return;
+    const sample = state.selected?.days ? state.selected : state.places.find((p) => p.days?.length);
+    if (!sample) { host.innerHTML = ""; return; }
     host.innerHTML = sample.days
       .map((d, i) => {
         const on = i === state.dayIndex ? "on" : "";
@@ -555,11 +308,10 @@
     const ranked = state.places
       .filter((p) => p.days)
       .map((p) => ({ p, g: currentGlow(p) }))
-      .filter((x) => x.g)
+      .filter((x) => F.finite(x.g?.score))
       .sort((a, b) => b.g.score - a.g.score);
     const top = ranked.slice(0, 12);
-    const sample = state.places.find((p) => p.days);
-    const when = sample ? dayLabel(sample.days[state.dayIndex].date, state.dayIndex) : "今日";
+    const when = state.dayIndex === 0 ? "各地今日" : `各地第 ${state.dayIndex + 1} 天`;
     const modeName = state.mode === "sunset" ? "晚霞" : "朝霞";
     const titleEl = $("rank-title");
     if (titleEl) titleEl.textContent = when + modeName + "靠前";
@@ -571,7 +323,7 @@
           <em>${i + 1}</em>
           <span class="rank-name">${p.name}<small>${p.province}</small></span>
           <span class="rank-grade g-${gr.key}">${gr.label}</span>
-          <b style="color:${gradeColor(g.score)}">${g.score}</b>
+          <b style="color:${gradeColor(g.score)}">${display(g.score)}</b>
         </button>`;
       })
       .join("");
@@ -582,12 +334,12 @@
         .slice(0, 8)
         .map(({ p, g }) => {
           const gr = gradeOf(g.score);
-          return `<button type="button" data-id="${p.id}"><span>${p.name}</span><b style="color:${gradeColor(g.score)}">${g.score}</b><small class="g-${gr.key}">${gr.label}</small></button>`;
+          return `<button type="button" data-id="${p.id}"><span>${p.name}</span><b style="color:${gradeColor(g.score)}">${display(g.score)}</b><small class="g-${gr.key}">${gr.label}</small></button>`;
         })
         .join("");
     }
     const hot = ranked.filter((x) => x.g.score >= 50).length;
-    $("rank-meta").textContent = `${modeName} · ${hot} 城达中烧以上`;
+    $("rank-meta").textContent = `${modeName} · ${hot} 城达中烧以上 · 点选核对光路`;
     renderMajors();
   }
 
@@ -602,7 +354,7 @@
       const p = placeByName(name);
       if (!p) return "";
       const g = currentGlow(p);
-      const score = g ? g.score : "·";
+      const score = display(g?.score);
       const on = state.selected && state.selected.id === p.id ? "on" : "";
       const color = g ? gradeColor(g.score) : "var(--faint)";
       return `<button type="button" class="major ${on}" data-id="${p.id}">
@@ -617,18 +369,18 @@
     const text = compact
       ? ({ "画布（中高云）": "画布", "光路（低云越少越好）": "光路" }[label] || label)
       : label;
-    const pct = Math.round(clamp(value, 0, 1) * 100);
+    const pct = F.finite(value) ? Math.round(clamp(value, 0, 1) * 100) : 0;
     return `<div class="bar">
       <span>${text}</span>
       <i><u style="width:${pct}%"></u></i>
-      <b>${pct}</b>
+      <b>${F.finite(value) ? pct : "—"}</b>
     </div>`;
   }
 
   function renderInspector() {
     const el = $("inspector");
     const place = state.selected;
-    if (!place || !place.days) {
+    if (!place || !place.days?.[state.dayIndex]) {
       el.hidden = true;
       el.innerHTML = "";
       document.body.classList.remove("has-inspect");
@@ -637,21 +389,26 @@
     const day = currentDay(place);
     const glow = currentGlow(place);
     const gr = gradeOf(glow.score);
-    const conf = confidence(state.dayIndex, glow);
+    const conf = confidence(state.dayIndex, glow, day);
     const s = glow.sample;
     const modeName = state.mode === "sunset" ? "晚霞" : "朝霞";
     const eventIso = state.mode === "sunset" ? day.sunset : day.sunrise;
     const eventName = state.mode === "sunset" ? "日落" : "日出";
-    const viewFrom = addMinutes(eventIso, state.mode === "sunset" ? -20 : -25);
-    const viewTo = addMinutes(eventIso, state.mode === "sunset" ? 25 : 15);
-    const hz = state.horizon;
+    const viewFrom = fmtTime(glow.viewFrom, day.timezone);
+    const viewTo = fmtTime(glow.viewTo, day.timezone);
+    const hz = glow.horizon;
+    const hzText = hz?.available
+      ? `太阳方位 ${Math.round(hz.azimuth)}° · 前方 50–150 km 共 ${hz.count} 个采样点，已计入指数；未考虑山体与建筑遮挡。`
+      : state.horizon?.text || "远处光路尚未核对；当前为本地云况估计。";
+    const dataNote = s ? [s.visKm == null ? "能见度缺测" : "", s.aod == null && s.pm25 == null ? "气溶胶缺测" : ""].filter(Boolean).join("、") : "";
+    const past = F.finite(eventIso) && eventIso * 1000 < Date.now();
     const strip = place.days
       .map((d, i) => {
         const g = state.mode === "sunset" ? d.sunsetGlow : d.sunriseGlow;
         const gg = gradeOf(g.score);
         return `<button class="strip ${i === state.dayIndex ? "on" : ""}" data-day="${i}" type="button">
           <small>${dayLabel(d.date, i)}</small>
-          <b style="color:${gradeColor(g.score)}">${g.score}</b>
+          <b style="color:${gradeColor(g.score)}">${display(g.score)}</b>
           <span class="g-${gg.key}">${gg.label}</span>
         </button>`;
       })
@@ -665,48 +422,50 @@
       <p class="kicker">${place.province} · ${place.region}</p>
       <h2>${place.name}</h2>
       <div class="score-row">
-        <div class="score" style="color:${gradeColor(glow.score)}">${glow.score}</div>
+        <div class="score" style="color:${gradeColor(glow.score)}">${display(glow.score)}</div>
         <div>
           <div class="grade-label g-${gr.key}">${gr.label}</div>
-          <p class="hint">${gr.hint} · ${wxMeta().label} · 置信${conf.label}</p>
+          <p class="hint">${gr.hint} · ${wxMeta().label} · 参考信心${conf.label}</p>
         </div>
       </div>
-      <p class="clock">${eventName} ${fmtTime(eventIso)} · 建议 ${viewFrom}–${viewTo}</p>
-      <p class="horizon">${wxMeta().hint}。气溶胶用 CAMS。当天较准，两天外只是趋势。火烧云是概率不是实况。</p>
+      <p class="clock">${day.date} · ${eventName} ${fmtTime(eventIso, day.timezone)}${past ? "（已过）" : ""}<br>当地时间 ${day.timezone} · 参考时段 ${viewFrom}–${viewTo}</p>
+      <p class="horizon">保守观赏指数 0–100，非发生概率。${wxMeta().hint}；两天外仅供趋势参考。关键通透度数据缺失时，最高按小烧评估。</p>
       <p class="diag">${diagnose(state.mode, glow)}</p>
       ${bar("画布（中高云）", glow.parts.canvas)}
       ${bar("光路（低云越少越好）", glow.parts.horizon)}
       ${bar("通透", glow.parts.clarity)}
       ${bar("未降水", glow.parts.rain)}
       <dl class="nums">
-        <div><dt>高云</dt><dd>${s ? Math.round(s.high) + "%" : "—"}</dd></div>
-        <div><dt>中云</dt><dd>${s ? Math.round(s.mid) + "%" : "—"}</dd></div>
-        <div><dt>低云</dt><dd>${s ? Math.round(s.low) + "%" : "—"}</dd></div>
-        <div><dt>能见度</dt><dd>${s ? s.visKm.toFixed(0) + " km" : "—"}</dd></div>
-        <div><dt>湿度</dt><dd>${s ? Math.round(s.rh) + "%" : "—"}</dd></div>
+        <div><dt>高云</dt><dd>${display(s?.high, "%")}</dd></div>
+        <div><dt>中云</dt><dd>${display(s?.mid, "%")}</dd></div>
+        <div><dt>低云</dt><dd>${display(s?.low, "%")}</dd></div>
+        <div><dt>能见度</dt><dd>${display(s?.visKm, " km")}</dd></div>
+        <div><dt>湿度</dt><dd>${display(s?.rh, "%")}</dd></div>
         <div><dt>PM2.5</dt><dd>${s && s.pm25 != null ? s.pm25.toFixed(0) : "—"}</dd></div>
         <div><dt>AOD</dt><dd>${s && s.aod != null ? s.aod.toFixed(2) : "—"}</dd></div>
-        <div><dt>${modeName}高峰</dt><dd>${s ? s.hourLabel : "—"}</dd></div>
+        <div><dt>数据获取</dt><dd>${fmtTime(day.fetchedAt / 1000, day.timezone)}</dd></div>
       </dl>
-      ${hz ? `<p class="horizon">${hz.text}</p>` : ""}
+      <p class="horizon">${hzText}</p>
+      ${dataNote ? `<p class="horizon">${dataNote}，已降低参考信心。</p>` : ""}
+      ${Date.now() - day.fetchedAt > CACHE_MS ? '<p class="horizon">缓存已过期，正在尝试更新；请勿用于临近判断。</p>' : ""}
       <div class="week">${strip}</div>
     `;
   }
 
   function markerHtml(place) {
     const g = currentGlow(place);
-    const score = g ? g.score : 0;
+    const score = g?.score;
     const gr = gradeOf(score);
     const hot = score >= 65 ? "hot" : "";
     const on = state.selected && state.selected.id === place.id ? "sel" : "";
     const side = MAP_LABELS[place.name];
     if (side) {
-      return `<button class="pin ${side} ${on}" type="button" style="--c:${gradeColor(score)}" data-id="${place.id}" aria-label="${place.name} ${gr.label} ${score}">
+      return `<button class="pin ${side} ${on}" type="button" style="--c:${gradeColor(score)}" data-id="${place.id}" aria-label="${place.name} ${gr.label} ${display(score)}">
         <i class="dot ${hot} g-${gr.key}" style="--c:${gradeColor(score)}"></i>
         <span class="pin-name">${place.name}</span>
       </button>`;
     }
-    return `<button class="dot ${hot} ${on} g-${gr.key}" type="button" style="--c:${gradeColor(score)}" data-id="${place.id}" title="${place.name} ${gr.label} ${score}" aria-label="${place.name} ${gr.label} ${score}"><i></i></button>`;
+    return `<button class="dot ${hot} ${on} g-${gr.key}" type="button" style="--c:${gradeColor(score)}" data-id="${place.id}" title="${place.name} ${gr.label} ${display(score)}" aria-label="${place.name} ${gr.label} ${display(score)}"><i></i></button>`;
   }
 
   function upsertMarker(place) {
@@ -750,6 +509,7 @@
     state.selected = place;
     state.horizon = null;
     paintMarkers();
+    renderDays();
     renderRank();
     renderInspector();
     if (fly && state.map) {
@@ -766,25 +526,37 @@
   }
 
   async function probeHorizon(place) {
-    const day = currentDay(place);
+    const day = currentDay(place), mode = state.mode, model = state.wxModel;
+    const token = ++state.probeToken, generation = state.generation;
+    state.horizon = null;
     if (!day) return;
-    const iso = state.mode === "sunset" ? day.sunset : day.sunrise;
-    const dlon = state.mode === "sunset" ? -2.1 : 2.1;
-    const lat = place.lat;
-    const lon = place.lon + dlon;
-    const side = state.mode === "sunset" ? "西" : "东";
+    const key = mode === "sunset" ? "sunsetGlow" : "sunriseGlow";
+    const glow = day[key];
+    if (!F.finite(glow?.score)) return;
+    const azimuth = F.sunPosition(glow.event, place.lat, place.lon).azimuth;
+    const points = [[50, 0], [150, 0], [150, -15], [150, 15]]
+      .map(([km, delta]) => F.destination(place.lat, place.lon, azimuth + delta, km));
+    const cacheKey = `${model}:${place.lat}:${place.lon}:${glow.event}`;
+    const cached = state.horizonCache.get(cacheKey);
+    if (cached && Date.now() - cached.t < CACHE_MS && glow.horizon?.available) return;
+    state.horizon = { text: "正在核对太阳方向的远处云况…" };
+    renderInspector();
     try {
-      const weather = asList(await getJSON(weatherURL(lat.toFixed(4), lon.toFixed(4))))[0];
-      const sample = pickHour(weather.hourly, null, iso);
-      if (!sample || state.selected !== place) return;
-      const blocked = sample.low >= 55;
-      state.horizon = {
-        low: sample.low,
-        text: `${side}侧约 200 km 低云 ${Math.round(sample.low)}%${blocked ? "，光路偏差" : "，光路相对干净"}`
-      };
-      renderInspector();
+      let samples;
+      if (cached && Date.now() - cached.t < CACHE_MS) samples = cached.samples;
+      else {
+        const raw = await getJSON(weatherURL(points.map((p) => p.lat.toFixed(4)).join(","), points.map((p) => p.lon.toFixed(4)).join(","), model));
+        samples = asList(raw).map((w) => F.sampleAt(w.hourly, null, glow.event));
+        state.horizonCache.set(cacheKey, { t: Date.now(), samples });
+      }
+      if (token !== state.probeToken || generation !== state.generation || state.selected !== place || day !== currentDay(place) || mode !== state.mode) return;
+      day[key] = F.applyHorizon(day[key], samples, azimuth);
+      state.horizon = { text: "远处云况缺测，指数暂未加入光路修正。" };
+      renderRank(); paintMarkers(); renderInspector();
     } catch {
-      /* optional */
+      if (token !== state.probeToken || generation !== state.generation) return;
+      state.horizon = { text: "远处云况暂不可用，指数暂未加入光路修正。" };
+      renderInspector();
     }
   }
 
@@ -842,15 +614,16 @@
   function layoutPadding() {
     const w = window.innerWidth;
     const h = window.innerHeight;
+    const top = Math.ceil(document.querySelector(".top").getBoundingClientRect().height) + 12;
     const portrait = h >= w;
     if (w < 720 || (w < 1100 && portrait)) {
-      return { paddingTopLeft: [10, 168], paddingBottomRight: [10, 96] };
+      return { paddingTopLeft: [10, top], paddingBottomRight: [10, 96] };
     }
     if (w < 1100) {
-      return { paddingTopLeft: [16, 128], paddingBottomRight: [state.selected ? 340 : 16, 84] };
+      return { paddingTopLeft: [16, top], paddingBottomRight: [state.selected ? 340 : 16, 84] };
     }
     return {
-      paddingTopLeft: [292, 140],
+      paddingTopLeft: [292, top],
       paddingBottomRight: [state.selected ? 360 : 24, 56]
     };
   }
@@ -878,9 +651,13 @@
 
   async function addCustom(lat, lon) {
     const id = "custom";
+    const token = ++state.customToken;
+    const generation = state.generation;
     setStatus("正在计算这个位置…", "load");
     try {
-      const days = await fetchOne(lat, lon);
+      lon = ((lon + 540) % 360) - 180;
+      const days = await fetchOne(lat, lon, state.wxModel);
+      if (generation !== state.generation || token !== state.customToken) return;
       let place = state.places.find((p) => p.id === id);
       if (!place) {
         place = { id, name: "地图选点", province: "自定义", region: "选点", lat, lon, aliases: "", days };
@@ -894,6 +671,7 @@
       selectPlace(id, true);
       renderDays();
     } catch (err) {
+      if (generation !== state.generation || token !== state.customToken) return;
       setStatus("这个点没拉到预报，请再试一次", "err");
       console.error(err);
     }
@@ -905,7 +683,6 @@
         state.mode = btn.dataset.mode;
         document.querySelectorAll("[data-mode]").forEach((b) => b.classList.toggle("on", b === btn));
         refreshView();
-        if (state.selected) probeHorizon(state.selected);
       });
     });
 
@@ -935,6 +712,7 @@
 
     $("inspector").addEventListener("click", (e) => {
       if (e.target.id === "close-inspector") {
+        state.probeToken++;
         state.selected = null;
         paintMarkers();
         renderRank();
@@ -949,22 +727,6 @@
     });
 
     $("loc").addEventListener("click", locateMe);
-
-    fetch("/api/info")
-      .then((r) => r.json())
-      .then((info) => {
-        const el = $("phone-url");
-        if (!el || !info.urls || !info.urls.length) return;
-        const pick =
-          info.urls.find((u) => u.indexOf("172.20.") >= 0) ||
-          info.urls.find((u) => u.indexOf("192.168.") >= 0) ||
-          info.urls.find((u) => u.indexOf("10.") >= 0) ||
-          info.urls[0];
-        el.hidden = false;
-        el.textContent = pick.replace(/^http:\/\//, "手机 ");
-        el.href = pick;
-      })
-      .catch(() => {});
 
     const q = $("q");
     const box = $("suggest");
@@ -1009,17 +771,20 @@
   }
 
   function refreshView() {
+    state.horizon = null;
+    state.probeToken++;
     renderDays();
     renderRank();
     paintMarkers();
     renderInspector();
-    const sample = state.places.find((p) => p.days);
-    const date = sample ? sample.days[state.dayIndex].date : "";
+    const sample = state.selected?.days ? state.selected : state.places.find((p) => p.days);
+    const date = sample?.days?.[state.dayIndex]?.date || "";
     $("headline").textContent =
       (state.mode === "sunset" ? "晚霞" : "朝霞") +
       " · " +
       wxMeta().label +
       (date ? " · " + date.replace(/-/g, ".") : "");
+    if (state.selected) probeHorizon(state.selected);
   }
 
   function locateMe() {
@@ -1080,122 +845,52 @@
 
   async function loadAll() {
     state.places = seedPlaces();
-    renderMajors();
-    const cached = cacheRead();
-    if (cached && cached.length) {
-      const byId = new Map(cached.map((p) => [p.id, p]));
-      state.places.forEach((p) => {
-        const hit = byId.get(p.id);
-        if (hit && hit.days) p.days = hit.days;
-      });
-      if (state.places.some((p) => p.days)) afterLoad();
-    }
-
-    const majors = MAJORS.map(placeByName).filter(Boolean);
-    const rest = state.places.filter((p) => p.id !== "custom" && majors.indexOf(p) < 0);
-
-    setStatus("正在加载热门城市云况…", "load");
-    try {
-      await Promise.all(chunk(majors, BATCH).map((b) => fetchWeatherBatch(b)));
-      snapshotPack();
-      afterLoad();
-      setStatus("");
-    } catch (err) {
-      console.error(err);
-      if (!state.booted) setStatus("热门城市暂时拉不到，稍后会再试", "err");
-    }
-
-    chunk(rest, BATCH)
-      .reduce(
-        (prev, batch) =>
-          prev.then(async () => {
-            try {
-              await fetchWeatherBatch(batch);
-              if (state.booted) {
-                paintMarkers();
-                renderRank();
-              }
-            } catch (e) {
-              console.error(e);
-            }
-          }),
-        Promise.resolve()
-      )
-      .then(() => {
-        snapshotPack();
-        cacheWrite(state.places);
-        if (state.booted) refreshView();
-        return Promise.all(chunk(majors.concat(rest), BATCH).map((b) => fetchAirBatch(b)));
-      })
-      .then(() => {
-        snapshotPack();
-        cacheWrite(state.places);
-        if (state.booted) refreshView();
-      })
-      .catch((err) => console.error(err));
+    await loadModel();
   }
-
+  async function loadModel() {
+    state.loading = true;
+    const generation = ++state.generation, model = state.wxModel;
+    state.probeToken++;
+    state.horizon = null;
+    const cached = cacheRead() || [];
+    const byId = new Map(cached.map((p) => [p.id, p]));
+    state.places.forEach((p) => {
+      p.days = byId.get(p.id)?.days || null;
+      p._weather = null;
+    });
+    refreshView();
+    if (cached.length) afterLoad();
+    setStatus("正在加载 " + wxMeta().label + " 云况…", "load");
+    const majors = MAJORS.map(placeByName).filter(Boolean);
+    const rest = state.places.filter((p) => !majors.includes(p));
+    const pending = majors.concat(rest).filter((p) => !freshDays(p.days));
+    let failures = 0;
+    for (const batch of chunk(pending, BATCH)) {
+      if (generation !== state.generation) return;
+      try {
+        await fetchWeatherBatch(batch, model, generation);
+        if (generation !== state.generation) return;
+        if (state.places.some((p) => p.days)) {
+          if (!state.booted) afterLoad();
+          else refreshView();
+        }
+        await fetchAirBatch(batch, generation);
+        if (generation !== state.generation) return;
+        if (state.places.some((p) => p.days)) refreshView();
+        cacheWrite();
+      } catch (e) { failures++; console.error(e); }
+    }
+    if (generation !== state.generation) return;
+    state.ready = state.places.some((p) => p.days);
+    state.loading = false;
+    setStatus(failures ? "部分地点暂时无法更新，可稍后点击重试。" : "", failures ? "err" : "");
+    refreshView();
+  }
   async function setWxModel(id) {
-    if (!id || id === state.wxModel) return;
-    snapshotPack();
+    if (!WX_MODELS.some((m) => m.id === id) || id === state.wxModel) return;
     state.wxModel = id;
     document.querySelectorAll("[data-wx]").forEach((b) => b.classList.toggle("on", b.dataset.wx === id));
-    if (restorePack(id)) {
-      refreshView();
-      if (state.selected) probeHorizon(state.selected);
-      return;
-    }
-    const cached = cacheRead();
-    if (cached && cached.length) {
-      const byId = new Map(cached.map((p) => [p.id, p]));
-      state.places.forEach((p) => {
-        const hit = byId.get(p.id);
-        p.days = hit && hit.days ? hit.days : null;
-        p._weather = null;
-      });
-      if (state.places.some((p) => p.days)) {
-        snapshotPack();
-        refreshView();
-      }
-    } else {
-      state.places.forEach((p) => {
-        p.days = null;
-        p._weather = null;
-      });
-    }
-    const majors = MAJORS.map(placeByName).filter(Boolean);
-    const rest = state.places.filter((p) => p.id !== "custom" && majors.indexOf(p) < 0);
-    setStatus("正在切换到 " + wxMeta().label + "…", "load");
-    try {
-      await Promise.all(chunk(majors, BATCH).map((b) => fetchWeatherBatch(b)));
-      snapshotPack();
-      refreshView();
-      setStatus("");
-      if (state.selected) probeHorizon(state.selected);
-    } catch (err) {
-      console.error(err);
-      setStatus(wxMeta().label + " 暂时不可用", "err");
-      return;
-    }
-    for (const batch of chunk(rest, BATCH)) {
-      try {
-        await fetchWeatherBatch(batch);
-        paintMarkers();
-        renderRank();
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    snapshotPack();
-    cacheWrite(state.places);
-    refreshView();
-    Promise.all(chunk(state.places.filter((p) => p.id !== "custom"), BATCH).map((b) => fetchAirBatch(b)))
-      .then(() => {
-        snapshotPack();
-        cacheWrite(state.places);
-        refreshView();
-      })
-      .catch(() => {});
+    await loadModel();
   }
 
   function afterLoad() {
@@ -1204,7 +899,6 @@
     document.querySelectorAll("[data-mode]").forEach((b) => b.classList.toggle("on", b.dataset.mode === state.mode));
     document.querySelectorAll("[data-wx]").forEach((b) => b.classList.toggle("on", b.dataset.wx === state.wxModel));
     state.ready = true;
-    state.loading = false;
     refreshView();
     if (!state.booted) {
       const home = placeByName("北京");
@@ -1215,9 +909,20 @@
   }
 
   function boot() {
+    const top = document.querySelector(".top");
+    const measureTop = () => document.documentElement.style.setProperty("--top-height", `${Math.ceil(top.getBoundingClientRect().height)}px`);
+    measureTop();
+    new ResizeObserver(measureTop).observe(top);
     initMap();
     bindUI();
     loadAll();
+    $("status").addEventListener("click", () => { if ($("status").dataset.kind === "err") loadModel(); });
+    // Refresh a tab left open through a local midnight or a model update.
+    const refreshIfStale = () => {
+      if (!document.hidden && !state.loading && state.places.some((p) => p.days && !freshDays(p.days))) loadModel();
+    };
+    setInterval(refreshIfStale, 60000);
+    document.addEventListener("visibilitychange", refreshIfStale);
     let resizeTimer = 0;
     const onResize = () => {
       clearTimeout(resizeTimer);
