@@ -4,7 +4,7 @@
 
   const FORECAST = "https://api.open-meteo.com/v1/forecast";
   const AIR = "https://air-quality-api.open-meteo.com/v1/air-quality";
-  const BATCH = 20;
+  const BATCH = 10;
   const DAYS = 7;
   const CACHE_KEY = "glow-v14";
   const CACHE_MS = 30 * 60 * 1000;
@@ -107,6 +107,7 @@
     generation: 0,
     probeToken: 0,
     customToken: 0,
+    retryAt: 0,
     horizonCache: new Map()
   };
 
@@ -179,14 +180,53 @@
 
   async function getJSON(url) {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 18000);
+    const timer = setTimeout(() => ctrl.abort(), 25000);
     try {
       const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) {
+        const err = new Error("HTTP " + res.status);
+        err.status = res.status;
+        if (res.status === 429) {
+          const header = res.headers?.get("Retry-After");
+          const seconds = header && Number(header);
+          const until = Number.isFinite(seconds) && seconds > 0 ? Date.now() + seconds * 1000 : Date.parse(header);
+          err.retryAt = Number.isFinite(until) && until > Date.now() ? until : Date.now() + 60000;
+        }
+        throw err;
+      }
       return await res.json();
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  function requestProblem(err) {
+    if (err?.status === 429) return "气象服务请求过多，暂时限流";
+    if (err?.name === "AbortError") return "网络请求超时";
+    if (err?.status >= 500) return "气象服务暂时异常";
+    if (err?.status) return `气象服务返回错误（${err.status}）`;
+    if (err?.name === "TypeError") return "网络连接未成功";
+    return "返回的预报数据不完整";
+  }
+
+  async function requestWeather(url, generation) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (generation !== state.generation) return null;
+      try { return await getJSON(url); }
+      catch (err) {
+        if (generation !== state.generation) return null;
+        // Do not amplify rate limits or retry permanent 4xx failures.
+        if (attempt || (err.status && err.status < 500)) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+  }
+
+  function loadFailureText(missing, err) {
+    const names = missing.slice(0, 3).map((p) => p.name).join("、");
+    const detail = names ? `（${names}${missing.length > 3 ? "等" : ""}）` : "";
+    const cooldown = err?.status === 429 ? `请约 ${Math.max(1, Math.ceil((err.retryAt - Date.now()) / 60000))} 分钟后重试。` : "可点击重试。";
+    return `${missing.length} 个地点未加载${detail}：${requestProblem(err)}。已加载的地点仍可查看；${cooldown}`;
   }
 
   function chunk(arr, n) {
@@ -230,14 +270,17 @@
     if (!batch.length || generation !== state.generation) return;
     const lats = batch.map((p) => p.lat.toFixed(4)).join(",");
     const lons = batch.map((p) => p.lon.toFixed(4)).join(",");
-    const raw = await getJSON(weatherURL(lats, lons, model));
-    if (generation !== state.generation) return;
+    const raw = await requestWeather(weatherURL(lats, lons, model), generation);
+    if (!raw || generation !== state.generation) return;
     const weathers = alignPayloads(batch, raw);
+    let complete = 0;
     batch.forEach((place, i) => {
       if (!weathers[i]?.daily || !weathers[i]?.hourly) return;
       place._weather = weathers[i];
       place.days = buildDays(weathers[i], null);
+      complete++;
     });
+    if (complete !== batch.length) throw new Error("incomplete weather batch");
   }
   async function fetchAirBatch(batch, generation) {
     const ready = batch.filter((p) => p._weather);
@@ -287,6 +330,8 @@
     el.textContent = text || "";
     el.dataset.kind = kind || "";
     el.hidden = !text;
+    el.setAttribute("role", kind === "err" ? "button" : "status");
+    el.tabIndex = kind === "err" ? 0 : -1;
   }
 
   function renderDays() {
@@ -848,6 +893,10 @@
     await loadModel();
   }
   async function loadModel() {
+    if (Date.now() < state.retryAt) {
+      setStatus(`气象服务仍在限流，请约 ${Math.max(1, Math.ceil((state.retryAt - Date.now()) / 60000))} 分钟后重试。已加载的地点仍可查看。`, "err");
+      return;
+    }
     state.loading = true;
     const generation = ++state.generation, model = state.wxModel;
     state.probeToken++;
@@ -863,13 +912,16 @@
     setStatus("正在加载 " + wxMeta().label + " 云况…", "load");
     const majors = MAJORS.map(placeByName).filter(Boolean);
     const rest = state.places.filter((p) => !majors.includes(p));
-    const pending = majors.concat(rest).filter((p) => !freshDays(p.days));
-    let failures = 0;
+    const ordered = state.selected ? [state.selected, ...majors.concat(rest).filter((p) => p !== state.selected)] : majors.concat(rest);
+    const pending = ordered.filter((p) => !freshDays(p.days));
+    let lastError;
+    let consecutiveFailures = 0;
     for (const batch of chunk(pending, BATCH)) {
       if (generation !== state.generation) return;
       try {
         await fetchWeatherBatch(batch, model, generation);
         if (generation !== state.generation) return;
+        consecutiveFailures = 0;
         if (state.places.some((p) => p.days)) {
           if (!state.booted) afterLoad();
           else refreshView();
@@ -878,16 +930,27 @@
         if (generation !== state.generation) return;
         if (state.places.some((p) => p.days)) refreshView();
         cacheWrite();
-      } catch (e) { failures++; console.error(e); }
+      } catch (e) {
+        if (generation !== state.generation) return;
+        lastError = e;
+        consecutiveFailures++;
+        cacheWrite();
+        console.error(e);
+        if (e.status === 429) { state.retryAt = e.retryAt; break; }
+        // A disconnected phone should not wait through every remaining global batch.
+        if (consecutiveFailures >= 2) break;
+      }
     }
     if (generation !== state.generation) return;
     state.ready = state.places.some((p) => p.days);
     state.loading = false;
-    setStatus(failures ? "部分地点暂时无法更新，可稍后点击重试。" : "", failures ? "err" : "");
+    const missing = pending.filter((p) => !freshDays(p.days));
+    setStatus(missing.length ? loadFailureText(missing, lastError) : "", missing.length ? "err" : "");
     refreshView();
   }
   async function setWxModel(id) {
     if (!WX_MODELS.some((m) => m.id === id) || id === state.wxModel) return;
+    if (Date.now() < state.retryAt) { loadModel(); return; }
     state.wxModel = id;
     document.querySelectorAll("[data-wx]").forEach((b) => b.classList.toggle("on", b.dataset.wx === id));
     await loadModel();
@@ -917,6 +980,9 @@
     bindUI();
     loadAll();
     $("status").addEventListener("click", () => { if ($("status").dataset.kind === "err") loadModel(); });
+    $("status").addEventListener("keydown", (e) => {
+      if ($("status").dataset.kind === "err" && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); loadModel(); }
+    });
     // Refresh a tab left open through a local midnight or a model update.
     const refreshIfStale = () => {
       if (!document.hidden && !state.loading && state.places.some((p) => p.days && !freshDays(p.days))) loadModel();
