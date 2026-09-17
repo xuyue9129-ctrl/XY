@@ -1,0 +1,7 @@
+server.py
+start.bat
+china.json
+phone-qr.png
+*.pyc
+__pycache__/
+.DS_Store

@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>XY · 全球朝晚霞预报</title>
+  <meta name="description" content="XY：按分层云量与气溶胶，预报全球朝霞晚霞。可切换 ECMWF / ICON / GFS / GRAPES。" />
+  <meta name="theme-color" content="#100c0a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect fill='%23100c0a' width='64' height='64'/><circle cx='48' cy='28' r='10' fill='%23ff6a2a'/><path d='M4 48c8-10 16-6 24-12s12 2 20-4 12-2 16 4' stroke='%23e8b15a' fill='none' stroke-width='3'/></svg>" />
+  <link rel="preload" href="vendor/leaflet.css" as="style" />
+  <link rel="preload" href="vendor/leaflet.js" as="script" />
+  <link rel="preload" href="cities.js?v=11" as="script" />
+  <link rel="preload" href="app.js?v=11" as="script" />
+  <link rel="preload" href="world.json" as="fetch" crossorigin />
+  <link rel="stylesheet" href="vendor/leaflet.css" />
+  <style>
+    :root {
+      --void: #100c0a;
+      --panel: #16110e;
+      --ink: #f4ece4;
+      --muted: #9a8778;
+      --faint: #6d5c50;
+      --line: rgba(244, 236, 228, 0.1);
+      --ember: #ff6a2a;
+      --gold: #e8b15a;
+      --font: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+      --display: "Songti SC", "STSong", "Noto Serif SC", "SimSun", serif;
+      --safe-t: env(safe-area-inset-top, 0px);
+      --safe-b: env(safe-area-inset-bottom, 0px);
+      --safe-l: env(safe-area-inset-left, 0px);
+      --safe-r: env(safe-area-inset-right, 0px);
+    }
+
+    * { box-sizing: border-box; }
+    html {
+      height: 100%;
+      height: 100dvh;
+      -webkit-text-size-adjust: 100%;
+    }
+    html, body { margin: 0; }
+    body {
+      font-family: var(--font);
+      color: var(--ink);
+      background: var(--void);
+      overflow: hidden;
+      min-height: 100%;
+      min-height: 100dvh;
+      touch-action: manipulation;
+    }
+    button, input { touch-action: manipulation; }
+
+    #map {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      background: #0b0908;
+    }
+    .leaflet-container { background: #100c0a !important; }
+    .leaflet-control-attribution {
+      background: rgba(16, 12, 10, 0.78) !important;
+      color: var(--faint) !important;
+      font-size: 10px !important;
+      font-family: var(--font);
+      max-width: 60vw;
+    }
+    .leaflet-control-attribution a { color: var(--muted) !important; }
+    .leaflet-control-zoom a {
+      background: var(--panel) !important;
+      color: var(--ink) !important;
+      border: 1px solid var(--line) !important;
+      width: 36px !important;
+      height: 36px !important;
+      line-height: 36px !important;
+      border-radius: 2px !important;
+    }
+    .leaflet-bar { border: 0 !important; box-shadow: none !important; }
+
+    .top {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: minmax(140px, auto) auto minmax(0, 1fr) auto;
+      grid-template-areas:
+        "brand modes days tools"
+        "wx wx wx wx"
+        "majors majors majors majors";
+      gap: 8px 16px;
+      align-items: center;
+      padding: calc(12px + var(--safe-t)) 20px 10px 20px;
+      padding-left: calc(20px + var(--safe-l));
+      padding-right: calc(20px + var(--safe-r));
+      background: linear-gradient(180deg, #100c0a 0%, rgba(16,12,10,0.96) 78%, transparent 100%);
+      pointer-events: none;
+    }
+    .top > * { pointer-events: auto; min-width: 0; }
+    .brand { grid-area: brand; display: flex; flex-direction: column; gap: 2px; }
+    .modes { grid-area: modes; }
+    #days { grid-area: days; }
+    .tools { grid-area: tools; }
+    .wx { grid-area: wx; }
+    .majors { grid-area: majors; }
+
+    .brand strong {
+      font-family: var(--font);
+      font-style: italic;
+      font-weight: 650;
+      font-size: clamp(24px, 2.4vw, 30px);
+      letter-spacing: 0.14em;
+      line-height: 1;
+      color: var(--gold);
+    }
+    .brand span {
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .modes {
+      display: flex;
+      gap: 4px;
+    }
+    .modes button {
+      appearance: none;
+      background: none;
+      border: 0;
+      color: var(--faint);
+      font: 500 15px/1 var(--font);
+      min-height: 40px;
+      padding: 8px 10px;
+      cursor: pointer;
+      border-bottom: 1px solid transparent;
+    }
+    .modes button.on {
+      color: var(--ink);
+      border-bottom-color: var(--ember);
+    }
+
+    .wx {
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .wx::-webkit-scrollbar { display: none; }
+    .wx button {
+      appearance: none;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      color: var(--faint);
+      font: 500 12px/1 var(--font);
+      min-height: 36px;
+      padding: 0 10px;
+      cursor: pointer;
+      flex: 0 0 auto;
+    }
+    .wx button.on {
+      color: var(--ink);
+      border-color: rgba(232, 177, 90, 0.65);
+    }
+
+    #days {
+      display: flex;
+      gap: 2px;
+      overflow-x: auto;
+      scrollbar-width: none;
+      -webkit-overflow-scrolling: touch;
+    }
+    #days::-webkit-scrollbar { display: none; }
+    .chip {
+      appearance: none;
+      background: transparent;
+      border: 0;
+      color: var(--faint);
+      min-width: 52px;
+      min-height: 44px;
+      padding: 6px 8px;
+      cursor: pointer;
+      text-align: left;
+      font-family: var(--font);
+      flex: 0 0 auto;
+    }
+    .chip span { display: block; font-size: 13px; font-weight: 500; }
+    .chip small { color: var(--faint); font-size: 10px; }
+    .chip.on { color: var(--ink); }
+    .chip.on small { color: var(--gold); }
+
+    .tools {
+      display: flex;
+      gap: 8px;
+      justify-self: end;
+      align-items: center;
+    }
+    .search { position: relative; flex: 1 1 auto; min-width: 0; }
+    .search input {
+      width: min(240px, 28vw);
+      height: 40px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      padding: 0 12px;
+      font: 400 16px/1 var(--font);
+      border-radius: 2px;
+      outline: none;
+    }
+    .search input:focus { border-color: rgba(232, 177, 90, 0.55); }
+    .search input::placeholder { color: var(--faint); font-size: 13px; }
+    #suggest {
+      position: absolute;
+      top: calc(100% + 4px);
+      right: 0;
+      left: 0;
+      min-width: 200px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 4px;
+      margin: 0;
+      z-index: 30;
+      max-height: 50vh;
+      overflow: auto;
+    }
+    #suggest button {
+      display: flex;
+      justify-content: space-between;
+      width: 100%;
+      background: none;
+      border: 0;
+      color: var(--ink);
+      font: 400 15px/1.4 var(--font);
+      padding: 12px 10px;
+      cursor: pointer;
+      text-align: left;
+    }
+    #suggest button:hover { background: rgba(255,255,255,0.04); }
+    #suggest small { color: var(--muted); }
+    #loc {
+      height: 40px;
+      min-width: 44px;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      font: 500 13px/1 var(--font);
+      cursor: pointer;
+      border-radius: 2px;
+      flex: 0 0 auto;
+    }
+    #loc:hover { border-color: var(--gold); }
+    .phone-url {
+      display: none;
+      color: var(--gold);
+      font-size: 11px;
+      text-decoration: none;
+      max-width: 22vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .majors {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      scrollbar-width: none;
+      -webkit-overflow-scrolling: touch;
+      padding-bottom: 2px;
+    }
+    .majors::-webkit-scrollbar { display: none; }
+    .major {
+      appearance: none;
+      flex: 0 0 auto;
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-height: 44px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      cursor: pointer;
+      font-family: var(--font);
+      border-radius: 2px;
+    }
+    .major strong {
+      font-size: 15px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+    }
+    .major b {
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 500;
+    }
+    .major.on {
+      border-color: rgba(232, 177, 90, 0.7);
+      background: rgba(255, 106, 42, 0.1);
+    }
+
+    .pin-wrap { background: none !important; border: 0 !important; }
+    .pin {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 26px;
+      padding: 0 8px 0 4px;
+      border: 1px solid var(--line);
+      background: rgba(22, 17, 14, 0.92);
+      color: var(--ink);
+      font-family: var(--font);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .pin.down {
+      flex-direction: column;
+      height: auto;
+      padding: 3px 8px 4px;
+      gap: 2px;
+    }
+    .pin .pin-name { font-size: 12px; font-weight: 500; letter-spacing: 0.04em; }
+    .pin.sel { border-color: var(--gold); }
+    .pin .dot { width: 8px; height: 8px; box-shadow: 0 0 0 2px color-mix(in srgb, var(--c) 40%, transparent); }
+    .pin .dot.hot { width: 9px; height: 9px; }
+
+    .rank {
+      position: fixed;
+      top: calc(128px + var(--safe-t));
+      left: calc(16px + var(--safe-l));
+      width: 268px;
+      bottom: calc(52px + var(--safe-b));
+      z-index: 15;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .rank header {
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+    .rank h1 {
+      margin: 0;
+      font: 500 13px/1.3 var(--font);
+      letter-spacing: 0.04em;
+    }
+    #rank-meta {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    #rank-list {
+      overflow: auto;
+      padding: 6px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .rank-row {
+      display: grid;
+      grid-template-columns: 22px 1fr auto 32px;
+      gap: 8px;
+      align-items: center;
+      width: 100%;
+      background: none;
+      border: 0;
+      color: inherit;
+      padding: 10px 8px;
+      min-height: 44px;
+      cursor: pointer;
+      font-family: var(--font);
+      text-align: left;
+    }
+    .rank-row:hover, .rank-row.on { background: rgba(255,255,255,0.04); }
+    .rank-row em {
+      font-style: normal;
+      color: var(--faint);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    .rank-name { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+    .rank-name small { color: var(--faint); font-size: 10px; }
+    .rank-grade { font-size: 11px; }
+    .rank-row b {
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    .inspector {
+      position: fixed;
+      top: calc(128px + var(--safe-t));
+      right: calc(16px + var(--safe-r));
+      width: min(332px, calc(100vw - 32px));
+      bottom: calc(52px + var(--safe-b));
+      z-index: 16;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 18px 18px 14px;
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .sheet-handle { display: none; }
+    .inspector .close {
+      position: absolute;
+      top: 8px; right: 8px;
+      width: 44px; height: 44px;
+      border: 0;
+      background: none;
+      color: var(--muted);
+      font-size: 22px;
+      cursor: pointer;
+    }
+    .kicker {
+      margin: 0;
+      color: var(--gold);
+      font-size: 11px;
+      letter-spacing: 0.14em;
+    }
+    .inspector h2 {
+      margin: 4px 0 12px;
+      font-family: var(--display);
+      font-style: italic;
+      font-weight: 500;
+      font-size: clamp(24px, 6vw, 34px);
+      line-height: 1.05;
+      padding-right: 36px;
+    }
+    .score-row {
+      display: flex;
+      gap: 14px;
+      align-items: flex-end;
+      margin-bottom: 8px;
+    }
+    .score {
+      font-family: var(--display);
+      font-weight: 650;
+      font-size: clamp(44px, 14vw, 72px);
+      line-height: 0.85;
+      font-variant-numeric: tabular-nums;
+    }
+    .grade-label { font-size: 18px; font-weight: 500; }
+    .hint, .clock, .diag, .horizon {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+      margin: 0 0 8px;
+    }
+    .diag { color: var(--ink); margin: 10px 0 14px; text-wrap: pretty; }
+
+    .bar {
+      display: grid;
+      grid-template-columns: minmax(72px, 108px) 1fr 28px;
+      gap: 8px;
+      align-items: center;
+      margin: 6px 0;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .bar i {
+      display: block;
+      height: 3px;
+      background: rgba(244,236,228,0.08);
+      position: relative;
+    }
+    .bar u {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      background: var(--ember);
+      text-decoration: none;
+    }
+    .bar b { font-weight: 500; color: var(--ink); font-variant-numeric: tabular-nums; text-align: right; }
+
+    .nums {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px 8px;
+      margin: 16px 0 8px;
+    }
+    .nums div { min-width: 0; }
+    .nums dt { color: var(--faint); font-size: 10px; }
+    .nums dd { margin: 2px 0 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+
+    .week {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(40px, 1fr));
+      gap: 4px;
+      margin-top: 12px;
+      overflow-x: auto;
+    }
+    .strip {
+      appearance: none;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid transparent;
+      color: inherit;
+      padding: 8px 2px;
+      min-height: 56px;
+      cursor: pointer;
+      font-family: var(--font);
+    }
+    .strip.on { border-color: var(--line); background: rgba(255,106,42,0.08); }
+    .strip small { display: block; color: var(--faint); font-size: 9px; }
+    .strip b { display: block; font-size: 13px; font-variant-numeric: tabular-nums; }
+    .strip span { font-size: 10px; }
+
+    .g-none { color: #7a7168; }
+    .g-faint { color: #c4a484; }
+    .g-small { color: #d4924a; }
+    .g-mid { color: #f07832; }
+    .g-big { color: #ff5a1f; }
+    .g-full { color: #ffd08a; }
+
+    .legend {
+      position: fixed;
+      left: calc(300px + var(--safe-l));
+      right: calc(24px + var(--safe-r));
+      bottom: calc(14px + var(--safe-b));
+      z-index: 12;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-end;
+      pointer-events: none;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    body.has-inspect .legend { right: calc(364px + var(--safe-r)); }
+
+    .film { display: none; }
+    .swatches { display: flex; gap: 10px; flex-wrap: wrap; }
+    .swatches b {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      margin-right: 5px;
+      vertical-align: 0;
+    }
+    .note { max-width: 420px; text-align: right; line-height: 1.45; }
+
+    #status {
+      position: fixed;
+      top: calc(76px + var(--safe-t));
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 40;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 8px 14px;
+      font-size: 13px;
+      color: var(--gold);
+      max-width: calc(100vw - 24px);
+    }
+    #status[data-kind="err"] { color: #e07a62; }
+
+    .dot-wrap { background: none !important; border: 0 !important; }
+    .dot {
+      width: 12px; height: 12px;
+      border: 0; padding: 0;
+      border-radius: 50%;
+      background: var(--c, #4e463f);
+      cursor: pointer;
+      display: grid; place-items: center;
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 28%, transparent);
+    }
+    .dot.hot {
+      width: 16px; height: 16px;
+      box-shadow: 0 0 16px var(--c), 0 0 0 4px color-mix(in srgb, var(--c) 30%, transparent);
+    }
+    .dot.sel {
+      outline: 2px solid #f4ece4;
+      outline-offset: 3px;
+    }
+    .dot i { display: none; }
+
+    @media (pointer: coarse) {
+      .dot { width: 18px; height: 18px; box-shadow: 0 0 0 5px color-mix(in srgb, var(--c) 28%, transparent); }
+      .dot.hot { width: 22px; height: 22px; }
+      .pin .dot, .pin .dot.hot { width: 8px; height: 8px; box-shadow: 0 0 0 2px color-mix(in srgb, var(--c) 40%, transparent); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * { scroll-behavior: auto !important; transition: none !important; }
+    }
+
+    /* 电脑宽屏：顶栏显示局域网提示 */
+    @media (min-width: 1100px) {
+      .phone-url { display: inline-block; }
+    }
+
+    /* 平板竖屏 / 中等宽度：不要左右双栏把地图挤没 */
+    @media (max-width: 1099px) {
+      .rank { display: none; }
+      .phone-url { display: none !important; }
+      .legend { left: calc(12px + var(--safe-l)); right: calc(12px + var(--safe-r)); }
+      body.has-inspect .legend { right: calc(12px + var(--safe-r)); }
+      .leaflet-bottom.leaflet-right { margin-bottom: 8px; }
+    }
+
+    /* 平板横屏：详情靠右，底部仍用横滑榜 */
+    @media (min-width: 720px) and (max-width: 1099px) and (orientation: landscape) {
+      .top {
+        grid-template-columns: auto auto minmax(0, 1fr) auto;
+        grid-template-areas:
+          "brand modes days tools"
+          "wx wx wx wx"
+          "majors majors majors majors";
+      }
+      .search input { width: min(200px, 24vw); }
+      .inspector {
+        top: calc(78px + var(--safe-t));
+        right: calc(12px + var(--safe-r));
+        width: min(320px, 38vw);
+        bottom: calc(78px + var(--safe-b));
+        height: auto;
+      }
+      .film {
+        display: flex;
+        right: auto;
+        width: calc(100% - min(320px, 38vw) - 24px);
+      }
+      body.has-inspect .film { display: flex; }
+      body.has-inspect .legend { right: calc(min(320px, 38vw) + 24px); }
+    }
+
+    /* 手机 + 平板竖屏 */
+    @media (max-width: 719px), (max-width: 1099px) and (orientation: portrait) {
+      .top {
+        grid-template-columns: 1fr auto;
+        grid-template-areas:
+          "brand modes"
+          "tools tools"
+          "wx wx"
+          "majors majors"
+          "days days";
+        gap: 6px 10px;
+        padding: calc(8px + var(--safe-t)) 12px 8px;
+        padding-left: calc(12px + var(--safe-l));
+        padding-right: calc(12px + var(--safe-r));
+      }
+      .brand strong { font-size: 22px; }
+      .brand span { font-size: 10px; letter-spacing: 0.12em; }
+      .modes { justify-self: end; gap: 0; }
+      .modes button { min-height: 44px; padding: 10px 8px; font-size: 15px; }
+      .tools { width: 100%; justify-self: stretch; }
+      .search { flex: 1; }
+      .search input,
+      #suggest { width: 100%; min-width: 0; }
+      .search input { height: 44px; font-size: 16px; }
+      #loc { height: 44px; }
+      #days { margin: 0 -4px; }
+      .chip { min-width: 48px; padding: 6px 7px; }
+      .wx button { min-height: 40px; font-size: 13px; padding: 0 12px; }
+      .major { min-height: 44px; padding: 8px 14px; }
+      .major strong { font-size: 16px; }
+      .film { display: none !important; }
+
+      .inspector {
+        top: auto;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: auto;
+        height: min(62dvh, 560px);
+        max-height: calc(100dvh - 96px - var(--safe-t));
+        border: 0;
+        border-top: 1px solid var(--line);
+        border-radius: 16px 16px 0 0;
+        padding: 8px 16px calc(16px + var(--safe-b));
+      }
+      .sheet-handle {
+        display: block;
+        width: 36px;
+        height: 4px;
+        border-radius: 2px;
+        background: rgba(244, 236, 228, 0.22);
+        margin: 4px auto 10px;
+      }
+      .inspector .close { top: 4px; right: 4px; }
+      .bar {
+        grid-template-columns: 48px 1fr 28px;
+      }
+      .nums { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 6px; }
+      .legend {
+        left: calc(12px + var(--safe-l));
+        right: calc(12px + var(--safe-r));
+        bottom: calc(86px + var(--safe-b));
+        font-size: 10px;
+      }
+      .legend .note { display: none; }
+      .swatches { gap: 8px; justify-content: center; width: 100%; }
+      body.has-inspect .legend { bottom: calc(min(62dvh, 560px) + 8px); }
+
+      .film {
+        display: flex;
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 14;
+        gap: 8px;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        padding: 8px 12px calc(10px + var(--safe-b));
+        padding-left: calc(12px + var(--safe-l));
+        padding-right: calc(12px + var(--safe-r));
+        background: linear-gradient(180deg, transparent, #100c0a 28%);
+        scrollbar-width: none;
+      }
+      .film::-webkit-scrollbar { display: none; }
+      .film button {
+        flex: 0 0 auto;
+        min-width: 80px;
+        min-height: 56px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        color: var(--ink);
+        padding: 8px 10px;
+        text-align: left;
+        font-family: var(--font);
+        cursor: pointer;
+      }
+      .film button span { display: block; font-size: 12px; }
+      .film button b { font-size: 16px; font-variant-numeric: tabular-nums; }
+      .film button small { font-size: 10px; }
+      body.has-inspect .film { display: none; }
+
+      .leaflet-control-zoom { display: none; }
+      .leaflet-control-attribution { display: none; }
+
+      #status {
+        left: 12px;
+        right: 12px;
+        transform: none;
+        top: auto;
+        bottom: calc(96px + var(--safe-b));
+        text-align: center;
+      }
+      body.has-inspect #status { bottom: calc(min(62dvh, 560px) + 8px); }
+    }
+  </style>
+</head>
+<body>
+  <div id="map" role="application" aria-label="全国朝晚霞地图"></div>
+
+  <header class="top">
+    <div class="brand">
+      <strong>XY</strong>
+      <span id="headline">全球朝晚霞</span>
+    </div>
+    <div class="modes" role="tablist">
+      <button type="button" data-mode="sunrise" role="tab">朝霞</button>
+      <button type="button" data-mode="sunset" class="on" role="tab">晚霞</button>
+    </div>
+    <div id="days"></div>
+    <div class="tools">
+      <div class="search">
+        <input id="q" type="search" placeholder="搜城市 / 点地图" autocomplete="off" enterkeyhint="search" />
+        <div id="suggest" hidden></div>
+      </div>
+      <button id="loc" type="button">定位</button>
+      <a id="phone-url" class="phone-url" href="#" hidden></a>
+    </div>
+    <div class="wx" role="tablist" aria-label="预报模式">
+      <button type="button" data-wx="ecmwf_ifs025" class="on">ECMWF 荐</button>
+      <button type="button" data-wx="icon_seamless">ICON</button>
+      <button type="button" data-wx="gfs_seamless">GFS</button>
+      <button type="button" data-wx="cma_grapes_global">GRAPES</button>
+      <button type="button" data-wx="best_match">自动</button>
+    </div>
+    <nav id="majors" class="majors" aria-label="热门城市"></nav>
+  </header>
+
+  <aside class="rank">
+    <header>
+      <h1 id="rank-title">今日晚霞靠前</h1>
+      <p id="rank-meta">正在计算…</p>
+    </header>
+    <div id="rank-list"></div>
+  </aside>
+
+  <aside class="inspector" id="inspector" hidden></aside>
+  <div id="film" class="film"></div>
+
+  <div class="legend">
+    <div class="swatches">
+      <span><b style="background:#4e463f"></b>难见</span>
+      <span><b style="background:#c4a484"></b>淡霞</span>
+      <span><b style="background:#d4924a"></b>小烧</span>
+      <span><b style="background:#f07832"></b>中烧</span>
+      <span><b style="background:#ff5a1f"></b>大烧</span>
+      <span><b style="background:#ffd08a"></b>满天</span>
+    </div>
+    <div class="note">XY。可切换 ECMWF（推荐）/ ICON / GFS / 中国 GRAPES。预报是概率，当天更准。</div>
+  </div>
+
+  <div id="status" hidden></div>
+
+  <script src="vendor/leaflet.js" defer></script>
+  <script src="cities.js?v=11" defer></script>
+  <script src="app.js?v=11" defer></script>
+</body>
+</html>
